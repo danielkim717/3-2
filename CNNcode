@@ -1,0 +1,258 @@
+#데이터 로드 및 분할
+
+import pandas as pd
+
+# 업로드한 pkl 불러오기
+df = pd.read_pickle("/content/WM811K.pkl")
+
+print(df.head())
+print("train/val/test 분포:", df["trainTestLabel"].value_counts())
+
+#데이터셋&데이터로더
+
+# ===== Colab 전용: WM-811K DataFrame 버전 → Dataset/DataLoader 통합 셋업 =====
+# 1) GPU 확인
+import torch, warnings, sys, subprocess
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+print("CUDA available:", torch.cuda.is_available())
+
+# 2) WM811K.pkl 업로드 (한 번만 업로드하면 /content/ 에 존재)
+from google.colab import files
+print("👇 WM811K.pkl 파일을 선택해서 업로드하세요")
+uploaded = files.upload()  # 파일 선택 창 뜸
+PKL_PATH = "/content/WM811K.pkl"  # 업로드한 파일명이 다르면 여기를 바꾸세요
+
+# 3) 로드 & 정규화(라벨/스플릿이 배열/대소문자 섞여도 안전)
+df = pd.read_pickle(PKL_PATH)
+print("DataFrame shape:", df.shape)
+print("Columns:", df.columns.tolist())
+
+def to_scalar_str(v):
+    if isinstance(v, (list, tuple, np.ndarray)):
+        a = np.array(v)
+        if a.size == 1:
+            try: v = a.item()
+            except Exception: v = a.reshape(-1)[0]
+        else:
+            v = "|".join(map(str, a.reshape(-1).tolist()))
+    return str(v)
+
+# 필수 컬럼 정규화
+assert "waferMap" in df.columns, "waferMap 컬럼이 필요합니다."
+assert "failureType" in df.columns, "failureType 컬럼이 필요합니다."
+df["failureType"] = df["failureType"].apply(to_scalar_str).str.strip()
+if "trainTestLabel" in df.columns:
+    df["trainTestLabel"] = df["trainTestLabel"].apply(to_scalar_str).str.strip()
+
+# 정상 라벨 표준화
+df["failureType"] = df["failureType"].replace(
+    {"None":"none","NONE":"none","Null":"none","null":"none"}
+)
+
+# 스플릿 표준화 (training / test)
+def normalize_split(v: str) -> str:
+    lv = str(v).lower()
+    if "train" in lv: return "training"
+    if "test"  in lv: return "test"
+    if lv in {"0","1"}: return "training" if lv=="0" else "test"
+    return lv
+if "trainTestLabel" in df.columns:
+    df["trainTestLabel"] = df["trainTestLabel"].apply(normalize_split)
+
+print("Unique failureType (sample 20):", sorted(df["failureType"].unique())[:20])
+if "trainTestLabel" in df.columns:
+    print("Split uniques:", sorted(df["trainTestLabel"].unique()))
+
+# 4) 제공 스플릿 그대로 사용 + train→val 분할
+SEED = 42
+if "trainTestLabel" in df.columns:
+    df_train_all = df[df["trainTestLabel"]=="training"].copy()
+    df_test      = df[df["trainTestLabel"]=="test"].copy()
+    if len(df_train_all)==0:
+        raise RuntimeError("training 표기가 0개입니다. 위 출력의 Split uniques를 확인하고 normalize_split 로직을 조정하세요.")
+    df_train, df_val = train_test_split(
+        df_train_all, test_size=0.15, random_state=SEED, stratify=df_train_all["failureType"]
+    )
+else:
+    # 만약 스플릿이 없으면 8:1:1로 생성
+    tr_all, df_test = train_test_split(df, test_size=0.1, random_state=SEED, stratify=df["failureType"])
+    df_train, df_val = train_test_split(tr_all, test_size=0.111, random_state=SEED, stratify=tr_all["failureType"])  # 0.111*0.9 ≈ 0.1
+
+print(f"[SPLIT] train={len(df_train)}, val={len(df_val)}, test={len(df_test)}")
+
+# 5) 라벨 매핑
+classes = sorted(df["failureType"].unique().tolist())
+label2idx = {c:i for i,c in enumerate(classes)}
+idx2label = {i:c for c,i in label2idx.items()}
+print(f"#classes = {len(classes)}")
+
+# 6) 전처리/증강 보조 함수
+def to_tensor_1ch(img):
+    """
+    numpy/image-like → torch.FloatTensor [1,H,W], 값 0~1 정규화
+    """
+    a = np.array(img)
+    if a.ndim == 3 and a.shape[-1] == 1:
+        a = a[...,0]
+    a = a.astype(np.float32)
+    # 0~1 스케일
+    amin, amax = float(a.min()), float(a.max())
+    a = (a - amin) / (amax - amin + 1e-8) if amax > amin else np.zeros_like(a, dtype=np.float32)
+    t = torch.from_numpy(a).float().unsqueeze(0)  # [1,H,W]
+    return t
+
+def resize_tensor_bilinear(t, size=128):
+    return F.interpolate(t.unsqueeze(0), size=(size, size), mode="bilinear", align_corners=False).squeeze(0)
+
+def random_geom_aug(t):
+    # 90° 회전 + 좌우/상하 flip (웨이퍼 대칭)
+    k = random.choice([0,1,2,3])       # 0,90,180,270
+    t = torch.rot90(t, k, dims=[1,2])
+    if random.random() < 0.5:
+        t = torch.flip(t, dims=[2])    # Hflip
+    if random.random() < 0.5:
+        t = torch.flip(t, dims=[1])    # Vflip
+    return t
+
+# 7) WaferDataset
+from typing import Dict
+class WaferDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, label2idx: Dict[str,int], train: bool = True, img_size: int = 128):
+        self.df = df.reset_index(drop=True)
+        self.label2idx = label2idx
+        self.train = train
+        self.img_size = img_size
+
+    def __len__(self): return len(self.df)
+
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        img = row["waferMap"]
+        y   = self.label2idx[str(row["failureType"])]
+        t = to_tensor_1ch(img)
+        t = resize_tensor_bilinear(t, self.img_size)
+        if self.train:
+            t = random_geom_aug(t)
+        return t, y
+
+# 8) DataLoader (+불균형 대응 WeightedRandomSampler)
+IMG_SIZE = 128
+BATCH   = 128
+
+train_ds = WaferDataset(df_train, label2idx, train=True,  img_size=IMG_SIZE)
+val_ds   = WaferDataset(df_val,   label2idx, train=False, img_size=IMG_SIZE)
+test_ds  = WaferDataset(df_test,  label2idx, train=False, img_size=IMG_SIZE)
+
+# 클래스 가중치 (반비례 가중) + 샘플러
+vc = df_train["failureType"].value_counts()
+w = np.array([1.0 / max(vc.get(lbl,1), 1) for lbl in classes], dtype=np.float32)
+w = w / w.mean()
+class_weight = torch.tensor(w, dtype=torch.float32)
+
+sample_weights = df_train["failureType"].map(lambda s: class_weight[label2idx[s]].item()).values
+sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH, sampler=sampler, num_workers=2, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH, shuffle=False,   num_workers=2, pin_memory=True)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH, shuffle=False,   num_workers=2, pin_memory=True)
+
+print("[OK] DataLoaders ready.")
+
+# 9) 빠른 무결성 체크(한 배치 꺼내 보기)
+imgs, labels = next(iter(train_loader))
+print("Batch image tensor shape:", imgs.shape)   # (B,1,128,128)
+print("Batch labels shape:", labels.shape)       # (B,)
+
+# 라벨 일부를 실제 이름으로 매핑해보기
+idx2label = {v:k for k,v in label2idx.items()}
+print("Sample labels:", [idx2label[int(l)] for l in labels[:10]])
+
+# 10) (선택) 배치 시각화 12장
+def show_grid(tensor_batch, label_batch, idx2label, cols=6):
+    n = min(len(tensor_batch), cols*2)
+    rows = math.ceil(n/cols)
+    plt.figure(figsize=(cols*2, rows*2))
+    for i in range(n):
+        plt.subplot(rows, cols, i+1)
+        plt.imshow(tensor_batch[i,0].cpu().numpy(), origin="lower", interpolation="nearest")
+        plt.title(idx2label[int(label_batch[i])], fontsize=8)
+        plt.xticks([]); plt.yticks([])
+    plt.tight_layout(); plt.show()
+
+show_grid(imgs, labels, idx2label, cols=6)
+
+#CNN 모델 정의
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class WaferCNN(nn.Module):
+    def __init__(self, num_classes, input_size=(1, 32, 32)):
+        super(WaferCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+
+        # 동적으로 fc1 입력 차원 계산
+        dummy_input = torch.zeros(1, *input_size)
+        conv_output_size = self._get_conv_output_size(dummy_input)
+
+        self.fc1 = nn.Linear(conv_output_size, 128)
+        self.fc2 = nn.Linear(128, num_classes)
+
+    def _get_conv_output_size(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        n_size = x.view(x.size(0), -1).size(1)
+        return n_size
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+        #학습 루프
+
+import torch.optim as optim
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = WaferCNN(num_classes=len(label2idx)).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+for epoch in range(5):  # 에포크 수는 나중에 조절
+    model.train()
+    running_loss = 0.0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+    print(f"Epoch {epoch+1}, Loss: {running_loss/len(train_loader)}")
+
+#평가
+
+from sklearn.metrics import classification_report
+
+model.eval()
+all_preds, all_labels = [], []
+
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images)
+        _, preds = torch.max(outputs, 1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+print(classification_report(all_labels, all_preds, target_names=list(label2idx.keys())))
